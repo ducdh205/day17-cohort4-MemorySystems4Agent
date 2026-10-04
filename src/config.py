@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 
-from model_provider import ProviderConfig
+from model_provider import ProviderConfig, normalize_provider
 
 
 @dataclass
@@ -26,27 +27,82 @@ class LabConfig:
 
 
 def load_config(base_dir: Path | None = None) -> LabConfig:
-    """Student TODO: load environment variables and return a LabConfig.
+    """Load the shared lab configuration from the environment and ``.env``.
 
-    Pseudocode:
-    1. Resolve the repo root or default to the current file parent.
-    2. Optionally load values from `.env`.
-    3. Create `state/` if it does not exist.
-    4. Return a populated LabConfig instance.
+    The defaults deliberately permit the deterministic offline agents to run
+    without credentials. A live agent is opt-in: it is only built when its
+    caller requests one and the selected provider is configured.
     """
 
     root = (base_dir or Path(__file__).resolve().parent.parent).resolve()
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        # ``python-dotenv`` is an optional live-mode convenience. Retaining
+        # this fallback keeps the required offline benchmark dependency-free.
+        pass
+    else:
+        load_dotenv(root / ".env")
 
-    # TODO: read env vars for one of the supported providers.
-    # Example knobs:
-    # - LLM_PROVIDER / LLM_MODEL
-    # - OPENAI_API_KEY
-    # - GEMINI_API_KEY
-    # - ANTHROPIC_API_KEY
-    # - OLLAMA_BASE_URL
-    # - OPENROUTER_API_KEY
-    # - CUSTOM_BASE_URL / CUSTOM_API_KEY
-    # TODO: create `root / "state"`.
-    # TODO: choose sensible defaults for compact memory.
+    state_dir = root / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
 
-    raise NotImplementedError("Students should implement load_config().")
+    provider = normalize_provider(os.getenv("LLM_PROVIDER", "openai"))
+    model_name = os.getenv("LLM_MODEL", "gpt-4o-mini")
+    judge_provider = normalize_provider(os.getenv("JUDGE_LLM_PROVIDER", provider))
+    judge_model_name = os.getenv("JUDGE_LLM_MODEL", model_name)
+
+    return LabConfig(
+        base_dir=root,
+        data_dir=root / "data",
+        state_dir=state_dir,
+        # Short conversations remain intact, while the ~3k-token stress
+        # fixture crosses this boundary several times.
+        compact_threshold_tokens=_positive_int("COMPACT_THRESHOLD_TOKENS", 800),
+        compact_keep_messages=_positive_int("COMPACT_KEEP_MESSAGES", 6),
+        model=_provider_config(provider, model_name),
+        judge_model=_provider_config(judge_provider, judge_model_name),
+    )
+
+
+def _positive_int(env_name: str, default: int) -> int:
+    """Read a positive integer setting and fail early for invalid input."""
+
+    raw_value = os.getenv(env_name)
+    if raw_value is None:
+        return default
+    try:
+        value = int(raw_value)
+    except ValueError as error:
+        raise ValueError(f"{env_name} must be a positive integer, got {raw_value!r}") from error
+    if value < 1:
+        raise ValueError(f"{env_name} must be a positive integer, got {raw_value!r}")
+    return value
+
+
+def _provider_config(provider: str, model_name: str) -> ProviderConfig:
+    """Build one provider config using the environment convention in Analysis.md."""
+
+    api_keys = {
+        "openai": os.getenv("OPENAI_API_KEY"),
+        "custom": os.getenv("CUSTOM_API_KEY"),
+        "gemini": os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"),
+        "anthropic": os.getenv("ANTHROPIC_API_KEY"),
+        "ollama": None,
+        "openrouter": os.getenv("OPENROUTER_API_KEY"),
+    }
+    base_urls = {
+        "openai": os.getenv("OPENAI_BASE_URL"),
+        "custom": os.getenv("CUSTOM_BASE_URL"),
+        "gemini": None,
+        "anthropic": None,
+        "ollama": os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
+        "openrouter": os.getenv("OPENROUTER_BASE_URL"),
+    }
+    return ProviderConfig(
+        provider=provider,
+        model_name=model_name,
+        temperature=float(os.getenv("LLM_TEMPERATURE", "0")),
+        api_key=api_keys[provider],
+        base_url=base_urls[provider],
+    )

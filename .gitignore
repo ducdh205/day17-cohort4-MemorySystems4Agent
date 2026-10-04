@@ -1,8 +1,15 @@
 .env
+.venv/
+.venv*
 lab.txt
 labs/
+.pytest_cache*
 .pytest_cache/
 __pycache__/
 *.pyc
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
 .DS_Store
 state/

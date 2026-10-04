@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from config import LabConfig, load_config
-from memory_store import estimate_tokens
+from memory_store import estimate_tokens, extract_profile_updates
 from model_provider import build_chat_model
 
 
@@ -29,47 +29,86 @@ class BaselineAgent:
         self.force_offline = force_offline
         self.sessions: dict[str, SessionState] = {}
 
-        # TODO: optionally initialize a real LangChain/LangGraph agent when dependencies exist.
         self.langchain_agent = None
+        if not force_offline and self._live_model_is_configured():
+            self.langchain_agent = self._maybe_build_langchain_agent()
 
     def reply(self, user_id: str, thread_id: str, message: str) -> dict[str, Any]:
-        """Student TODO: return the agent response and token accounting.
+        """Reply with only the state belonging to ``thread_id``."""
 
-        Pseudocode:
-        - If a live agent exists, call the live path.
-        - Otherwise use a deterministic offline path.
-        """
-
-        raise NotImplementedError
+        # User identity intentionally does not select or restore state here.
+        # Doing so would give this comparison agent cross-session memory.
+        del user_id
+        if self.langchain_agent is not None:
+            return self._reply_live(thread_id, message)
+        return self._reply_offline(thread_id, message)
 
     def token_usage(self, thread_id: str) -> int:
-        # TODO: return cumulative agent token count for one thread.
-        raise NotImplementedError
+        return self.sessions.get(thread_id, SessionState()).token_usage
 
     def prompt_token_usage(self, thread_id: str) -> int:
-        # TODO: estimate how much prompt context this baseline kept processing.
-        raise NotImplementedError
+        return self.sessions.get(thread_id, SessionState()).prompt_tokens_processed
 
     def compaction_count(self, thread_id: str) -> int:
         # Baseline has no compact memory.
         return 0
 
     def _reply_offline(self, thread_id: str, message: str) -> dict[str, Any]:
-        """Student TODO: implement a simple offline behavior.
+        """Use deterministic within-thread recall for repeatable benchmarks."""
 
-        Suggested behavior:
-        - Store the new user message in the session
-        - Generate a short deterministic reply
-        - Update token counts
-        - Never remember facts across different thread ids
-        """
-
-        raise NotImplementedError
+        session = self.sessions.setdefault(thread_id, SessionState())
+        session.messages.append({"role": "user", "content": message})
+        prompt_tokens = sum(estimate_tokens(item["content"]) for item in session.messages)
+        answer = self._offline_response(session.messages, message)
+        output_tokens = estimate_tokens(answer)
+        session.messages.append({"role": "assistant", "content": answer})
+        session.token_usage += output_tokens
+        session.prompt_tokens_processed += prompt_tokens
+        return self._turn_result(answer, output_tokens, prompt_tokens)
 
     def _maybe_build_langchain_agent(self):
-        """Student TODO: optionally wire `create_agent` + `InMemorySaver` here.
+        """Build the configured chat model only for explicitly live configurations."""
 
-        Use `build_chat_model(self.config.model)` so the baseline can run with any supported provider.
-        """
+        return build_chat_model(self.config.model)
 
-        raise NotImplementedError
+    def _live_model_is_configured(self) -> bool:
+        return self.config.model.provider == "ollama" or bool(self.config.model.api_key)
+
+    def _reply_live(self, thread_id: str, message: str) -> dict[str, Any]:
+        session = self.sessions.setdefault(thread_id, SessionState())
+        session.messages.append({"role": "user", "content": message})
+        prompt_tokens = sum(estimate_tokens(item["content"]) for item in session.messages)
+        result = self.langchain_agent.invoke(session.messages)
+        answer = result.content if isinstance(result.content, str) else str(result.content)
+        output_tokens = estimate_tokens(answer)
+        session.messages.append({"role": "assistant", "content": answer})
+        session.token_usage += output_tokens
+        session.prompt_tokens_processed += prompt_tokens
+        return self._turn_result(answer, output_tokens, prompt_tokens)
+
+    @staticmethod
+    def _offline_response(messages: list[dict[str, str]], message: str) -> str:
+        facts: dict[str, str] = {}
+        for item in messages:
+            if item["role"] == "user":
+                facts.update(extract_profile_updates(item["content"]))
+
+        question = message.lower()
+        if "tên" in question and facts.get("name"):
+            return f"Trong thread này, bạn cho biết tên là {facts['name']}."
+        if ("nghề" in question or "làm gì" in question) and facts.get("profession"):
+            return f"Trong thread này, bạn cho biết bạn là {facts['profession']}."
+        if ("ở đâu" in question or "nơi ở" in question) and facts.get("location"):
+            return f"Trong thread này, bạn cho biết bạn ở {facts['location']}."
+        if message.strip().endswith("?"):
+            return "Mình chưa có thông tin đó trong thread này."
+        return "Mình đã ghi nhận thông tin trong thread hiện tại."
+
+    @staticmethod
+    def _turn_result(answer: str, output_tokens: int, prompt_tokens: int) -> dict[str, Any]:
+        return {
+            "answer": answer,
+            "response": answer,
+            "agent_tokens": output_tokens,
+            "prompt_tokens": prompt_tokens,
+        }
